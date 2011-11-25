@@ -155,6 +155,7 @@ static audiohd_codec_info_t audiohd_codecs[] = {
 	{0x13f69880, "CMedia CMI19880", 0x0},
 	{0x14f15045, "Conexant CX20549", (NO_MIXER)},
 	{0x14f15051, "Conexant CX20561", 0x0},
+	{0x14f15069, "Conexant CX20585", (NO_MIXER)},
 	{0x434d4980, "CMedia CMI19880", 0x0},
 	{0x80862802, "Intel HDMI", 0x0},
 	{0x83847610, "Sigmatel STAC9230XN", 0x0},
@@ -5424,8 +5425,7 @@ audiohd_enable_pin(audiohd_state_t *statep, int caddr, wid_t wid)
 		return;
 	tmp = audioha_codec_verb_get(statep, caddr, wid,
 	    AUDIOHDC_VERB_SET_PIN_CTRL,
-	    tmp | AUDIOHDC_PIN_CONTROL_OUT_ENABLE |
-	    AUDIOHDC_PIN_CONTROL_HP_ENABLE);
+	    tmp | AUDIOHDC_PIN_CONTROL_OUT_ENABLE);
 }
 
 /*
