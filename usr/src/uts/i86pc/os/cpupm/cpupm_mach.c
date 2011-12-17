@@ -95,6 +95,15 @@ cpupm_state_domains_t *cpupm_tstate_domains = NULL;
 cpupm_state_domains_t *cpupm_cstate_domains = NULL;
 
 /*
+ * p-state tunables
+ *
+ * cpupm_pstate_max sets the maximum p-state index from
+ * cpu_acpi_state_t::cs_pstates::ss_states array.
+ * -1 means that the value should be read from ACPI _PPC object
+ */
+int32_t cpupm_pstate_max = -1;
+
+/*
  * c-state tunables
  *
  * cpupm_cs_sample_interval is the length of time we wait before
@@ -888,6 +897,10 @@ cpupm_get_top_speed(cpu_t *cp)
 	nspeeds = CPU_ACPI_PSTATES_COUNT(handle);
 
 	max_level = nspeeds - 1;
+
+	if (cpupm_pstate_max > 0 && cpupm_pstate_max <= max_level)
+		return (cpupm_pstate_max);
+
 	if ((plat_level < 0) || (plat_level > max_level)) {
 		cmn_err(CE_NOTE, "!cpupm_get_top_speed: CPU %d: "
 		    "_PPC out of range %d", cp->cpu_id, plat_level);
