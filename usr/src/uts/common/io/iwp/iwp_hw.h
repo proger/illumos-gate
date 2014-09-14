@@ -2623,6 +2623,14 @@ typedef struct iwp_stop_scan {
 #define	CCMP_MIC_LEN	(8)
 #define	TKIP_ICV_LEN	(4)
 
+/* Possible flags for register CSR_HW_REV. */
+#define CSR_HW_REV_TYPE_SHIFT   4
+#define CSR_HW_REV_TYPE_MASK    0xf
+#define CSR_HW_REV_TYPE_1000    6
+#define CSR_HW_REV_TYPE_6000    7
+#define CSR_HW_REV_TYPE_6050    8
+#define CSR_HW_REV_TYPE_6005    11
+
 #ifdef __cplusplus
 }
 #endif

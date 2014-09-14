@@ -28,6 +28,7 @@
 
 /*
  * Intel(R) WiFi Link 6000 Driver
+ * Intel(R) WiFi Link 1000 Driver
  */
 
 #include <sys/types.h>
@@ -83,7 +84,7 @@
  * if want to see debug message of a given section,
  * please set this flag to one of above values
  */
-uint32_t iwp_dbg_flags = 0;
+uint32_t iwp_dbg_flags = 255;
 #define	IWP_DBG(x) \
 	iwp_dbg x
 #else
@@ -97,6 +98,10 @@ static void	*iwp_soft_state_p = NULL;
  */
 static uint8_t iwp_fw_bin [] = {
 #include "fw-iw/iwp.ucode"
+};
+
+static uint8_t iwp1000_fw_bin [] = {
+#include "fw-iw/iwp1000.ucode"
 };
 
 /*
@@ -403,6 +408,8 @@ _init(void)
 		ddi_soft_state_fini(&iwp_soft_state_p);
 	}
 
+	cmn_err(CE_WARN, "_init(): hi friends\n");
+
 	return (status);
 }
 
@@ -479,6 +486,8 @@ iwp_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	int			intr_actual;
 	int			err = DDI_FAILURE;
 
+	cmn_err(CE_WARN, "iwp_attach(): hi friends\n");
+
 	switch (cmd) {
 	case DDI_ATTACH:
 		break;
@@ -531,6 +540,8 @@ iwp_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	    (sc->sc_dev_id != 0x422C) &&
 	    (sc->sc_dev_id != 0x4238) &&
 	    (sc->sc_dev_id != 0x4239) &&
+	    (sc->sc_dev_id != 0x0083) &&
+	    (sc->sc_dev_id != 0x0084) &&
 	    (sc->sc_dev_id != 0x008d) &&
 	    (sc->sc_dev_id != 0x008e)) {
 		cmn_err(CE_WARN, "iwp_attach(): "
@@ -578,7 +589,11 @@ iwp_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	/*
 	 * this is used to differentiate type of hardware
 	 */
-	sc->sc_hw_rev = IWP_READ(sc, CSR_HW_REV);
+	sc->sc_hw_rev = (IWP_READ(sc, CSR_HW_REV) >> CSR_HW_REV_TYPE_SHIFT) & CSR_HW_REV_TYPE_MASK;
+	if (sc->sc_hw_rev == CSR_HW_REV_TYPE_1000) {
+		cmn_err(CE_WARN, "iwp_attach(): "
+		    "attaching Intel WiFi Link 1000 -- dragons ahead\n");
+	}
 
 	err = ddi_intr_get_supported_types(dip, &intr_type);
 	if ((err != DDI_SUCCESS) || (!(intr_type & DDI_INTR_TYPE_FIXED))) {
@@ -698,7 +713,10 @@ iwp_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 		goto attach_fail9;
 	}
 
-	sc->sc_hdr = (iwp_firmware_hdr_t *)iwp_fw_bin;
+	sc->sc_hdr =
+	    sc->sc_hw_rev != CSR_HW_REV_TYPE_1000
+	    ? (iwp_firmware_hdr_t *)iwp_fw_bin
+	    : (iwp_firmware_hdr_t *)iwp1000_fw_bin;
 
 	/*
 	 * copy ucode to dma buffer
@@ -1524,6 +1542,9 @@ iwp_alloc_tx_ring(iwp_sc_t *sc, iwp_tx_ring_t *ring,
 		goto fail;
 	}
 
+	if (qid > 4)
+		return 0;
+
 #ifdef	DEBUG
 	dma_p = &ring->dma_desc;
 #endif
@@ -1554,7 +1575,8 @@ iwp_alloc_tx_ring(iwp_sc_t *sc, iwp_tx_ring_t *ring,
 	dma_p = &ring->dma_cmd;
 #endif
 	IWP_DBG((IWP_DEBUG_DMA, "iwp_alloc_tx_ring(): "
-	    "tx cmd[ncookies:%d addr:%lx size:%lx]\n",
+	    "tx qid %d cmd[ncookies:%d addr:%lx size:%lx]\n",
+	    qid,
 	    dma_p->ncookies, dma_p->cookie.dmac_address,
 	    dma_p->cookie.dmac_size));
 
@@ -1597,8 +1619,9 @@ iwp_alloc_tx_ring(iwp_sc_t *sc, iwp_tx_ring_t *ring,
 	dma_p = &ring->data[0].dma_data;
 #endif
 	IWP_DBG((IWP_DEBUG_DMA, "iwp_alloc_tx_ring(): "
-	    "tx buffer[0][ncookies:%d addr:%lx "
+	    "tx qid %d buffer[0][ncookies:%d addr:%lx "
 	    "size:%lx]\n",
+	    qid,
 	    dma_p->ncookies, dma_p->cookie.dmac_address,
 	    dma_p->cookie.dmac_size));
 
@@ -1617,21 +1640,28 @@ static void
 iwp_reset_tx_ring(iwp_sc_t *sc, iwp_tx_ring_t *ring)
 {
 	iwp_tx_data_t *data;
+	int i;
+#if 0
 	int i, n;
 
 	iwp_mac_access_enter(sc);
 
+#define TX_RESET_ATTEMPTS	2000
+
+	IWP_DBG((IWP_DEBUG_DMA, "iwp_reset_tx_ring(): "
+	    "resetting tx ring %d\n", ring->qid));
+
 	IWP_WRITE(sc, IWP_FH_TCSR_CHNL_TX_CONFIG_REG(ring->qid), 0);
-	for (n = 0; n < 200; n++) {
+	for (n = 0; n < TX_RESET_ATTEMPTS; n++) {
 		if (IWP_READ(sc, IWP_FH_TSSR_TX_STATUS_REG) &
 		    IWP_FH_TSSR_TX_STATUS_REG_MSK_CHNL_IDLE(ring->qid)) {
 			break;
 		}
-		DELAY(10);
+		DELAY(100);
 	}
 
 #ifdef	DEBUG
-	if (200 == n) {
+	if (TX_RESET_ATTEMPTS == n) {
 		IWP_DBG((IWP_DEBUG_DMA, "iwp_reset_tx_ring(): "
 		    "timeout reset tx ring %d\n",
 		    ring->qid));
@@ -1639,10 +1669,14 @@ iwp_reset_tx_ring(iwp_sc_t *sc, iwp_tx_ring_t *ring)
 #endif
 
 	iwp_mac_access_exit(sc);
+#endif
 
 	/* by pass, if it's quiesce */
 	if (!(sc->sc_flags & IWP_F_QUIESCED)) {
 		for (i = 0; i < ring->count; i++) {
+			if (ring->data == NULL)
+				continue;
+
 			data = &ring->data[i];
 			IWP_DMA_SYNC(data->dma_data, DDI_DMA_SYNC_FORDEV);
 		}
@@ -4094,6 +4128,9 @@ iwp_config(iwp_sc_t *sc)
 	const uint8_t bcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 	int err = IWP_FAIL;
 
+	IWP_WRITE(sc, CSR_ANA_PLL_CFG, IWP_READ(sc, CSR_ANA_PLL_CFG) | IWP_CSR_ANA_PLL_CFG);
+	
+#if 0
 	/*
 	 * set power mode. Disable power management at present, do it later
 	 */
@@ -4106,6 +4143,9 @@ iwp_config(iwp_sc_t *sc)
 		    "failed to set power mode\n");
 		return (err);
 	}
+#endif
+
+#if 0
 
 	/*
 	 * configure bt coexistence
@@ -4121,6 +4161,7 @@ iwp_config(iwp_sc_t *sc)
 		    "failed to configurate bt coexistence\n");
 		return (err);
 	}
+#endif
 
 	/*
 	 * configure rxon
@@ -4173,6 +4214,10 @@ iwp_config(iwp_sc_t *sc)
 	    (0x7 << RXON_RX_CHAIN_VALID_POS) |
 	    (0x2 << RXON_RX_CHAIN_FORCE_SEL_POS) |
 	    (0x2 << RXON_RX_CHAIN_FORCE_MIMO_SEL_POS));
+
+	sc->sc_config.ofdm_ht_single_stream_basic_rates = 0xff;
+	sc->sc_config.ofdm_ht_dual_stream_basic_rates = 0xff;
+	sc->sc_config.ofdm_ht_triple_stream_basic_rates = 0xff;
 
 	err = iwp_cmd(sc, REPLY_RXON, &sc->sc_config,
 	    sizeof (iwp_rxon_cmd_t), 0);
