@@ -36,7 +36,6 @@
 static int audiohd_attach(dev_info_t *, ddi_attach_cmd_t);
 static int audiohd_detach(dev_info_t *, ddi_detach_cmd_t);
 static int audiohd_quiesce(dev_info_t *);
-static int audiohd_resume(audiohd_state_t *);
 static int audiohd_suspend(audiohd_state_t *);
 
 /*
@@ -46,7 +45,7 @@ static int audiohd_init_state(audiohd_state_t *, dev_info_t *);
 static int audiohd_init_pci(audiohd_state_t *, ddi_device_acc_attr_t *);
 static void audiohd_fini_pci(audiohd_state_t *);
 static int audiohd_reset_controller(audiohd_state_t *);
-static int audiohd_init_controller(audiohd_state_t *);
+static int audiohd_init_controller(audiohd_state_t *, ddi_attach_cmd_t);
 static void audiohd_fini_controller(audiohd_state_t *);
 static void audiohd_stop_dma(audiohd_state_t *);
 static void audiohd_disable_intr(audiohd_state_t *);
@@ -60,7 +59,6 @@ static uint32_t audioha_codec_verb_get(void *, uint8_t,
     uint8_t, uint16_t, uint8_t);
 static uint32_t audioha_codec_4bit_verb_get(void *, uint8_t,
     uint8_t, uint16_t, uint16_t);
-static int audiohd_reinit_hda(audiohd_state_t *);
 static int audiohd_response_from_codec(audiohd_state_t *,
     uint32_t *, uint32_t *);
 static void audiohd_restore_codec_gpio(audiohd_state_t *);
@@ -85,6 +83,11 @@ static void audiohd_do_set_beep_volume(audiohd_state_t *,
 static void audiohd_set_beep_volume(audiohd_state_t *);
 static int audiohd_set_beep(void *, uint64_t);
 static void audiohd_pin_sense(audiohd_state_t *, uint32_t, uint32_t);
+
+static void audiohd_change_widget_power_state(audiohd_state_t *, int);
+static void audiohd_configure_input(audiohd_state_t *);
+static void audiohd_configure_output(audiohd_state_t *);
+static void audiohd_reset_pins_ur_cap(audiohd_state_t *);
 
 static	int	audiohd_beep;
 static	int	audiohd_beep_divider;
@@ -306,90 +309,121 @@ audiohd_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 {
 	audiohd_state_t		*statep;
 	int			instance;
+	uint8_t			rirbsts;
 
 	instance = ddi_get_instance(dip);
 	switch (cmd) {
 	case DDI_ATTACH:
+		/* allocate the soft state structure */
+		statep = kmem_zalloc(sizeof (*statep), KM_SLEEP);
+		ddi_set_driver_private(dip, statep);
+
+		mutex_init(&statep->hda_mutex, NULL, MUTEX_DRIVER, 0);
 		break;
 
 	case DDI_RESUME:
 		statep = ddi_get_driver_private(dip);
 		ASSERT(statep != NULL);
-		return (audiohd_resume(statep));
+		statep->suspended = B_FALSE;
+		break;
 
 	default:
 		return (DDI_FAILURE);
 	}
 
-	/* allocate the soft state structure */
-	statep = kmem_zalloc(sizeof (*statep), KM_SLEEP);
-	ddi_set_driver_private(dip, statep);
-
-	mutex_init(&statep->hda_mutex, NULL, MUTEX_DRIVER, 0);
 	mutex_enter(&statep->hda_mutex);
 
-	/* interrupt cookie and initialize mutex */
-	if (audiohd_init_state(statep, dip) != DDI_SUCCESS) {
-		audio_dev_warn(NULL, "audiohd_init_state failed");
-		goto error;
+	if (cmd == DDI_ATTACH) {
+		/* interrupt cookie */
+		if (audiohd_init_state(statep, dip) != DDI_SUCCESS) {
+			audio_dev_warn(NULL, "audiohd_init_state failed");
+			goto error;
+		}
 	}
 
-	/* Set PCI command register to enable bus master and memeory I/O */
+	/* Set PCI command register to enable bus master and memory I/O */
 	if (audiohd_init_pci(statep, &hda_dev_accattr) != DDI_SUCCESS) {
-		audio_dev_warn(statep->adev,
-		    "couldn't init pci regs");
+		audio_dev_warn(statep->adev, "couldn't init pci regs");
 		goto error;
 	}
 
-	audiohd_set_chipset_info(statep);
+	if (cmd == DDI_ATTACH) {
+		audiohd_set_chipset_info(statep);
+	}
 
-	if (audiohd_init_controller(statep) != DDI_SUCCESS) {
+	if (audiohd_init_controller(statep, cmd) != DDI_SUCCESS) {
 		audio_dev_warn(statep->adev,
 		    "couldn't init controller");
 		goto error;
 	}
 
-	if (audiohd_create_codec(statep) != DDI_SUCCESS) {
-		audio_dev_warn(statep->adev,
-		    "couldn't create codec");
-		goto error;
+	if (cmd == DDI_ATTACH) {
+		if (audiohd_create_codec(statep) != DDI_SUCCESS) {
+			audio_dev_warn(statep->adev, "couldn't create codec");
+			goto error;
+		}
+
+		audiohd_build_path(statep);
+
+		audiohd_get_channels(statep);
+		if (audiohd_allocate_port(statep) != DDI_SUCCESS) {
+			audio_dev_warn(statep->adev, "allocate port failure");
+			goto error;
+		}
+
+		audiohd_init_path(statep);
+
+		/* set up kernel statistics */
+		if ((statep->hda_ksp = kstat_create(DRVNAME, instance,
+		    DRVNAME, "controller", KSTAT_TYPE_INTR, 1,
+		    KSTAT_FLAG_PERSISTENT)) != NULL) {
+			kstat_install(statep->hda_ksp);
+		}
+
+		/* disable interrupts and clear interrupt status */
+		audiohd_disable_intr(statep);
+
+		/*
+		 * Register audio controls.
+		 */
+		audiohd_create_controls(statep);
+
+		if (audio_dev_register(statep->adev) != DDI_SUCCESS) {
+			audio_dev_warn(statep->adev,
+			    "unable to register with framework");
+			goto error;
+		}
+		ddi_report_dev(dip);
+
+		mutex_exit(&statep->hda_mutex);
+	} else if (cmd == DDI_RESUME) {
+		audiohd_restore_codec_gpio(statep);
+		audiohd_restore_path(statep);
+		audiohd_init_path(statep);
+
+		/* set widget power to D0 */
+		audiohd_change_widget_power_state(statep, AUDIOHD_PW_D0);
+
+		/* reset to enable the capability of unsolicited response for pin */
+		audiohd_reset_pins_ur_cap(statep);
+
+		/* clear the unsolicited response interrupt */
+		rirbsts = AUDIOHD_REG_GET8(AUDIOHD_REG_RIRBSTS);
+		AUDIOHD_REG_SET8(AUDIOHD_REG_RIRBSTS, rirbsts);
+
+		audiohd_configure_output(statep);
+		audiohd_configure_input(statep);
+
+		mutex_exit(&statep->hda_mutex);
+
+		audio_dev_resume(statep->adev);
 	}
 
-	audiohd_build_path(statep);
-
-	audiohd_get_channels(statep);
-	if (audiohd_allocate_port(statep) != DDI_SUCCESS) {
-		audio_dev_warn(statep->adev, "allocate port failure");
-		goto error;
-	}
-	audiohd_init_path(statep);
-	/* set up kernel statistics */
-	if ((statep->hda_ksp = kstat_create(DRVNAME, instance,
-	    DRVNAME, "controller", KSTAT_TYPE_INTR, 1,
-	    KSTAT_FLAG_PERSISTENT)) != NULL) {
-		kstat_install(statep->hda_ksp);
-	}
-
-	/* disable interrupts and clear interrupt status */
-	audiohd_disable_intr(statep);
-
-	/*
-	 * Register audio controls.
-	 */
-	audiohd_create_controls(statep);
-
-	if (audio_dev_register(statep->adev) != DDI_SUCCESS) {
-		audio_dev_warn(statep->adev,
-		    "unable to register with framework");
-		goto error;
-	}
-	ddi_report_dev(dip);
-
-	mutex_exit(&statep->hda_mutex);
 	return (DDI_SUCCESS);
 error:
 	mutex_exit(&statep->hda_mutex);
-	audiohd_destroy(statep);
+	if (cmd == DDI_ATTACH)
+		audiohd_destroy(statep);
 	return (DDI_FAILURE);
 }
 
@@ -2076,8 +2110,7 @@ audiohd_beep_freq(void *arg, int freq)
  *
  * Description
  *	This routine initailizes soft state of driver instance,
- *	also, it requests an interrupt cookie and initializes
- *	mutex for soft state.
+ *	and requests an interrupt cookie.
  */
 /*ARGSUSED*/
 static int
@@ -2380,53 +2413,6 @@ audiohd_release_dma_mem(audiohd_dma_t *pdma)
 }	/* audiohd_release_dma_mem() */
 
 /*
- * audiohd_reinit_hda()
- *
- * Description:
- *	This routine is used to re-initialize HD controller and codec.
- */
-static int
-audiohd_reinit_hda(audiohd_state_t *statep)
-{
-	uint64_t	addr;
-
-	/* set PCI configure space in case it's not restored OK */
-	(void) audiohd_init_pci(statep, &hda_dev_accattr);
-
-	/* reset controller */
-	if (audiohd_reset_controller(statep) != DDI_SUCCESS)
-		return (DDI_FAILURE);
-	AUDIOHD_REG_SET32(AUDIOHD_REG_SYNC, 0); /* needn't sync stream */
-
-	/* Initialize controller RIRB */
-	addr = statep->hda_dma_rirb.ad_paddr;
-	AUDIOHD_REG_SET32(AUDIOHD_REG_RIRBLBASE, (uint32_t)addr);
-	AUDIOHD_REG_SET32(AUDIOHD_REG_RIRBUBASE,
-	    (uint32_t)(addr >> 32));
-	AUDIOHD_REG_SET16(AUDIOHD_REG_RIRBWP, AUDIOHDR_RIRBWP_RESET);
-	AUDIOHD_REG_SET8(AUDIOHD_REG_RIRBSIZE, AUDIOHDR_RIRBSZ_256);
-	AUDIOHD_REG_SET8(AUDIOHD_REG_RIRBCTL, AUDIOHDR_RIRBCTL_DMARUN |
-	    AUDIOHDR_RIRBCTL_RINTCTL);
-
-	/* Initialize controller CORB */
-	addr = statep->hda_dma_corb.ad_paddr;
-	AUDIOHD_REG_SET16(AUDIOHD_REG_CORBRP, AUDIOHDR_CORBRP_RESET);
-	AUDIOHD_REG_SET32(AUDIOHD_REG_CORBLBASE, (uint32_t)addr);
-	AUDIOHD_REG_SET32(AUDIOHD_REG_CORBUBASE,
-	    (uint32_t)(addr >> 32));
-	AUDIOHD_REG_SET8(AUDIOHD_REG_CORBSIZE, AUDIOHDR_CORBSZ_256);
-	AUDIOHD_REG_SET16(AUDIOHD_REG_CORBWP, 0);
-	AUDIOHD_REG_SET16(AUDIOHD_REG_CORBRP, 0);
-	AUDIOHD_REG_SET8(AUDIOHD_REG_CORBCTL, AUDIOHDR_CORBCTL_DMARUN);
-
-	audiohd_restore_codec_gpio(statep);
-	audiohd_restore_path(statep);
-	audiohd_init_path(statep);
-
-	return (DDI_SUCCESS);
-}	/* audiohd_reinit_hda */
-
-/*
  * audiohd_init_controller()
  *
  * Description:
@@ -2436,7 +2422,7 @@ audiohd_reinit_hda(audiohd_state_t *statep)
  *	stream.
  */
 static int
-audiohd_init_controller(audiohd_state_t *statep)
+audiohd_init_controller(audiohd_state_t *statep, ddi_attach_cmd_t cmd)
 {
 	uint64_t	addr;
 	uint16_t	gcap;
@@ -2457,58 +2443,61 @@ audiohd_init_controller(audiohd_state_t *statep)
 		0			/* flags */
 	};
 
-	gcap = AUDIOHD_REG_GET16(AUDIOHD_REG_GCAP);
+	if (cmd == DDI_ATTACH) {
+		gcap = AUDIOHD_REG_GET16(AUDIOHD_REG_GCAP);
 
-	/*
-	 * If the device doesn't support 64-bit DMA, we should not
-	 * allocate DMA memory from 4G above
-	 */
-	if ((gcap & AUDIOHDR_GCAP_64OK) == 0)
-		dma_attr.dma_attr_addr_hi = 0xffffffffUL;
+		/*
+		 * If the device doesn't support 64-bit DMA, we should not
+		 * allocate DMA memory from 4G above
+		 */
+		if ((gcap & AUDIOHDR_GCAP_64OK) == 0)
+			dma_attr.dma_attr_addr_hi = 0xffffffffUL;
 
-	statep->hda_input_streams = (gcap & AUDIOHDR_GCAP_INSTREAMS) >>
-	    AUDIOHD_INSTR_NUM_OFF;
-	statep->hda_output_streams = (gcap & AUDIOHDR_GCAP_OUTSTREAMS) >>
-	    AUDIOHD_OUTSTR_NUM_OFF;
-	statep->hda_streams_nums = statep->hda_input_streams +
-	    statep->hda_output_streams;
+		statep->hda_input_streams = (gcap & AUDIOHDR_GCAP_INSTREAMS) >>
+		    AUDIOHD_INSTR_NUM_OFF;
+		statep->hda_output_streams = (gcap & AUDIOHDR_GCAP_OUTSTREAMS) >>
+		    AUDIOHD_OUTSTR_NUM_OFF;
+		statep->hda_streams_nums = statep->hda_input_streams +
+		    statep->hda_output_streams;
 
-	statep->hda_record_regbase = AUDIOHD_REG_SD_BASE;
-	statep->hda_play_regbase = AUDIOHD_REG_SD_BASE + AUDIOHD_REG_SD_LEN *
-	    statep->hda_input_streams;
+		statep->hda_record_regbase = AUDIOHD_REG_SD_BASE;
+		statep->hda_play_regbase = AUDIOHD_REG_SD_BASE + AUDIOHD_REG_SD_LEN *
+		    statep->hda_input_streams;
 
-	/* stop all dma before starting to reset controller */
-	audiohd_stop_dma(statep);
+		/* stop all dma before starting to reset controller */
+		audiohd_stop_dma(statep);
+	}
 
 	if (audiohd_reset_controller(statep) != DDI_SUCCESS)
 		return (DDI_FAILURE);
 
-	/* check codec */
-	statep->hda_codec_mask = AUDIOHD_REG_GET16(AUDIOHD_REG_STATESTS);
-	if (!statep->hda_codec_mask) {
-		audio_dev_warn(statep->adev,
-		    "no codec exists");
-		return (DDI_FAILURE);
-	}
+	if (cmd == DDI_ATTACH) {
+		/* check codec */
+		statep->hda_codec_mask = AUDIOHD_REG_GET16(AUDIOHD_REG_STATESTS);
+		if (!statep->hda_codec_mask) {
+			audio_dev_warn(statep->adev, "no codec exists");
+			return (DDI_FAILURE);
+		}
 
-	/* allocate DMA for CORB */
-	retval = audiohd_alloc_dma_mem(statep, &statep->hda_dma_corb,
-	    AUDIOHD_CDBIO_CORB_LEN, &dma_attr,
-	    DDI_DMA_WRITE | DDI_DMA_STREAMING);
-	if (retval != DDI_SUCCESS) {
-		audio_dev_warn(statep->adev,
-		    "failed to alloc DMA for CORB");
-		return (DDI_FAILURE);
-	}
+		/* allocate DMA for CORB */
+		retval = audiohd_alloc_dma_mem(statep, &statep->hda_dma_corb,
+		    AUDIOHD_CDBIO_CORB_LEN, &dma_attr,
+		    DDI_DMA_WRITE | DDI_DMA_STREAMING);
+		if (retval != DDI_SUCCESS) {
+			audio_dev_warn(statep->adev,
+			    "failed to alloc DMA for CORB");
+			return (DDI_FAILURE);
+		}
 
-	/* allocate DMA for RIRB */
-	retval = audiohd_alloc_dma_mem(statep, &statep->hda_dma_rirb,
-	    AUDIOHD_CDBIO_RIRB_LEN, &dma_attr,
-	    DDI_DMA_READ | DDI_DMA_STREAMING);
-	if (retval != DDI_SUCCESS) {
-		audio_dev_warn(statep->adev,
-		    "failed to alloc DMA for RIRB");
-		return (DDI_FAILURE);
+		/* allocate DMA for RIRB */
+		retval = audiohd_alloc_dma_mem(statep, &statep->hda_dma_rirb,
+		    AUDIOHD_CDBIO_RIRB_LEN, &dma_attr,
+		    DDI_DMA_READ | DDI_DMA_STREAMING);
+		if (retval != DDI_SUCCESS) {
+			audio_dev_warn(statep->adev,
+			    "failed to alloc DMA for RIRB");
+			return (DDI_FAILURE);
+		}
 	}
 
 	AUDIOHD_REG_SET32(AUDIOHD_REG_SYNC, 0); /* needn't sync stream */
@@ -5339,39 +5328,6 @@ audiohd_restore_codec_gpio(audiohd_state_t *statep)
 		}
 	}
 }
-/*
- * audiohd_resume()
- */
-static int
-audiohd_resume(audiohd_state_t *statep)
-{
-	uint8_t		rirbsts;
-
-	mutex_enter(&statep->hda_mutex);
-	statep->suspended = B_FALSE;
-	/* Restore the hda state */
-	if (audiohd_reinit_hda(statep) == DDI_FAILURE) {
-		audio_dev_warn(statep->adev,
-		    "hda reinit failed");
-		mutex_exit(&statep->hda_mutex);
-		return (DDI_FAILURE);
-	}
-	/* reset to enable the capability of unsolicited response for pin */
-	audiohd_reset_pins_ur_cap(statep);
-	/* clear the unsolicited response interrupt */
-	rirbsts = AUDIOHD_REG_GET8(AUDIOHD_REG_RIRBSTS);
-	AUDIOHD_REG_SET8(AUDIOHD_REG_RIRBSTS, rirbsts);
-	/* set widget power to D0 */
-	audiohd_change_widget_power_state(statep, AUDIOHD_PW_D0);
-
-	audiohd_configure_output(statep);
-	audiohd_configure_input(statep);
-	mutex_exit(&statep->hda_mutex);
-
-	audio_dev_resume(statep->adev);
-
-	return (DDI_SUCCESS);
-}	/* audiohd_resume */
 
 /*
  * audiohd_suspend()
