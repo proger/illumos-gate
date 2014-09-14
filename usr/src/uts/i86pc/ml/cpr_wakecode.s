@@ -891,6 +891,31 @@ wc_rm_end:
 	movw		%ax, %ss		/ ... and ss:esp
 	D16 movl	$WC_STKSTART, %esp
 
+	/*                                                                                                                                                     
+	 * Reset the video hardware (as best as we can).
+	 * We call the video bios at c000:0003, similar to
+	 * what the BIOS does on a machine restart.
+	 * Note that this will only reset the video card, 
+	 * and may not enable LCDs or other attached displays.
+	 *
+	 * This will also put the hardware in "factory default"
+	 * display mode, which may not match what we had
+	 * when we went to sleep. On many machines (specifically
+	 * laptops), we might not restore the proper VGA mode
+	 * on resume. Caveat emptor.
+	 */
+	
+	movw    %ax, %cs
+	lcall   $0xc000, $3
+
+	/*
+	 * Restore our segment registers in case the call to 
+	 * reset the video hardware clobbered them.
+	 */
+	movw    %cs, %ax
+	movw    %ax, %ds
+	movw    %ax, %ss
+
 #if     LED
 	D16 movl        $WC_LED, %edx
 	D16 movb        $0xd1, %al
